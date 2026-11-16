@@ -1,0 +1,6 @@
+{
+  "name": "Nova AgriSense",
+  "description": "Multi-tenant agricultural intelligence platform for The Gambia and West Africa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

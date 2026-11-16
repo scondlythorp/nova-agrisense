@@ -1,0 +1,113 @@
+name: Nova AgriSense CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  api-checks:
+    name: Python FastAPI + PostgreSQL RLS Integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4-alpine
+        env:
+          POSTGRES_USER: nova_admin
+          POSTGRES_PASSWORD: ci_admin_password
+          POSTGRES_DB: nova_agrisense_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U nova_admin -d nova_agrisense_test"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+    defaults:
+      run:
+        working-directory: apps/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: apps/api/requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run Ruff lint
+        run: ruff check app tests alembic
+      - name: Wait for PostgreSQL and verify PostGIS readiness
+        env:
+          PGPASSWORD: ci_admin_password
+        run: |
+          for attempt in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U nova_admin -d nova_agrisense_test >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
+          done
+          pg_isready -h localhost -p 5432 -U nova_admin -d nova_agrisense_test
+          psql -h localhost -U nova_admin -d nova_agrisense_test -v ON_ERROR_STOP=1 -c "
+            SELECT version();
+            CREATE EXTENSION IF NOT EXISTS postgis;
+            SELECT PostGIS_Full_Version();
+          "
+      - name: Verify Alembic migration upgrade, rollback, and re-upgrade
+        env:
+          NOVA_ENV: test
+          NOVA_DATABASE_URL: postgresql+psycopg://nova_admin:ci_admin_password@localhost:5432/nova_agrisense_test
+          NOVA_SECRET_KEY: ci-test-secret-key-with-at-least-thirty-two-bytes
+        run: |
+          alembic upgrade head
+          alembic downgrade base
+          alembic upgrade head
+      - name: Create non-superuser runtime role (NOBYPASSRLS) and verify RLS enforcement flags
+        env:
+          PGPASSWORD: ci_admin_password
+        run: |
+          psql -h localhost -U nova_admin -d nova_agrisense_test -v ON_ERROR_STOP=1 -c "
+            CREATE ROLE nova_app_user WITH LOGIN PASSWORD 'ci_app_password' NOBYPASSRLS NOSUPERUSER NOCREATEDB NOCREATEROLE;
+            GRANT USAGE ON SCHEMA public TO nova_app_user;
+            GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA public TO nova_app_user;
+            GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO nova_app_user;
+          "
+          psql -h localhost -U nova_admin -d nova_agrisense_test -tAc \
+            "SELECT NOT rolsuper AND NOT rolbypassrls FROM pg_roles WHERE rolname = 'nova_app_user'" | grep -qx t
+          psql -h localhost -U nova_admin -d nova_agrisense_test -tAc \
+            "SELECT count(*) = 2 FROM pg_class WHERE relname IN ('organization_memberships', 'audit_logs') AND relrowsecurity AND relforcerowsecurity" | grep -qx t
+      - name: Run Pytest suite as non-superuser (fail on any failure or skipped test)
+        env:
+          NOVA_ENV: test
+          NOVA_DATABASE_URL: postgresql+psycopg://nova_app_user:ci_app_password@localhost:5432/nova_agrisense_test
+          NOVA_TEST_DATABASE_URL: postgresql+psycopg://nova_app_user:ci_app_password@localhost:5432/nova_agrisense_test
+          NOVA_SECRET_KEY: ci-test-secret-key-with-at-least-thirty-two-bytes
+        run: |
+          pytest -v -rs --junitxml=/tmp/pytest-results.xml
+          python -c "import xml.etree.ElementTree as ET; root = ET.parse('/tmp/pytest-results.xml').getroot(); suite = root if root.tag == 'testsuite' else root.find('testsuite'); assert suite is not None; skipped = int(suite.attrib.get('skipped', '0')); tests = int(suite.attrib.get('tests', '0')); assert tests > 0 and skipped == 0, f'Unexpected skipped={skipped} tests={tests}'"
+
+  web-checks:
+    name: Next.js Web Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Run frontend unit tests
+        run: npm test
+      - name: Build Next.js production bundle
+        env:
+          NODE_ENV: production
+        run: npm run build

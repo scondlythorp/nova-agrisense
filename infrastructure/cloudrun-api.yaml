@@ -1,0 +1,44 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: nova-agrisense-api
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/cloudsql-instances: PROJECT_ID:REGION:INSTANCE_NAME
+    spec:
+      containerConcurrency: 80
+      timeoutSeconds: 60
+      serviceAccountName: nova-api-sa@PROJECT_ID.iam.gserviceaccount.com
+      containers:
+        - image: REGION-docker.pkg.dev/PROJECT_ID/nova-agrisense/api:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NOVA_ENV
+              value: production
+            - name: NOVA_API_V1_PREFIX
+              value: /api/v1
+            - name: NOVA_CORS_ORIGINS
+              value: https://APP_DOMAIN
+            - name: NOVA_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: nova-database-url
+                  key: latest
+            - name: NOVA_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: nova-secret-key
+                  key: latest
+          startupProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
+          livenessProbe:
+            httpGet:
+              path: /api/v1/health
+              port: 8080
